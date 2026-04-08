@@ -1,16 +1,17 @@
-"""Data transforms for BEHAVIOR-1K dataset.
+"""BEHAVIOR-1K 전용 데이터 변환 모음.
 
-Standard transforms imported from OpenPI.
-B1K-specific: TaskIndexToTaskId, ComputeSubtaskStateFromMeta, TokenizeFASTActions
-
-Reference: https://github.com/wensi-ai/openpi/tree/behavior
+OpenPI 기본 변환에 더해,
+- 전역 task id를 12개 subset용 로컬 task id로 바꾸는 변환
+- 필요할 때만 timestamp로 stage를 계산하는 변환
+- FAST 보조 토큰을 만드는 변환
+을 추가했다.
 """
 
 import dataclasses
 import logging
 import numpy as np
 
-# Import all standard transforms from OpenPI
+# OpenPI에서 기본 변환 도구들을 가져온다.
 from openpi.transforms import (
     DataTransformFn,
     DataDict,
@@ -25,7 +26,7 @@ from openpi.transforms import (
     DeltaActions,
     AbsoluteActions,
     PadStatesAndActions,
-    PromptFromLeRobotTask,  # Not used for PI_BEHAVIOR but kept for compatibility
+    PromptFromLeRobotTask,  # PI_BEHAVIOR에서는 거의 쓰지 않지만 호환성을 위해 남겨둔다.
     flatten_dict,
     unflatten_dict,
     transform_dict,
@@ -40,23 +41,17 @@ from b1k.shared.normalize import NormStats
 
 @dataclasses.dataclass(frozen=True)
 class TaskIndexToTaskId(DataTransformFn):
-    """Directly converts task_index to task_id for PI_BEHAVIOR model.
-    
-    PI_BEHAVIOR uses task embeddings instead of text prompts. This transform
-    converts the dataset's task_index to task_id and prepares tokenized_prompt
-    as [task_id, subtask_state] for the model.
-    
-    Assumes:
-    - data["task_index"] exists (from dataset)
-    - data["subtask_state"] exists (computed by ComputeSubtaskStateFromMeta)
-    
-    Creates:
-    - data["tokenized_prompt"]: np.array([task_id, subtask_state], dtype=int32)
-    - data["tokenized_prompt_mask"]: np.array([True, True], dtype=bool)
+    """task_index 또는 task_id를 모델용 tokenized_prompt로 바꾼다.
+
+    이 버전의 기본 경로는 stage conditioning을 사용하지 않는다.
+    따라서 tokenized_prompt는 보통 [local_task_id] 한 개 토큰만 만든다.
+
+    task_mapping을 주면
+    - 학습 시: 전역 task id(예: 18)를 로컬 task id(예: 7)로 바꾼다.
+    - 추론 시: 환경이 주는 전역 task id도 같은 방식으로 바꿀 수 있다.
     """
-    
-    # Optional task remapping (dataset task_index → model task_id)
-    # If None, assumes direct mapping (task_index == task_id)
+
+    # Optional task remapping (global/original task id -> local subset task id)
     task_mapping: dict[int, int] | None = None
     
     def __call__(self, data: DataDict) -> DataDict:
@@ -82,17 +77,13 @@ class TaskIndexToTaskId(DataTransformFn):
                 return data  # Already has tokenized_prompt, skip this transform
             raise ValueError("Either task_index, task_id, or tokenized_prompt is required for PI_BEHAVIOR model")
 
-        # Pack task_id and subtask_state (if available) into tokenized_prompt
-        if "subtask_state" in data:
-            subtask_state = int(data["subtask_state"])
-            prompt_tokens = np.array([task_id, subtask_state], dtype=np.int32)  # [task_id, subtask_state]
-            prompt_mask = np.array([True, True], dtype=bool)
-        else:
-            prompt_tokens = np.array([task_id], dtype=np.int32)  # Just [task_id]
-            prompt_mask = np.array([True], dtype=bool)
+        # 기본 경로는 stage 토큰을 따로 붙이지 않고
+        # 최종적으로 로컬 task id 하나만 모델에 전달한다.
+        prompt_tokens = np.array([task_id], dtype=np.int32)
+        prompt_mask = np.array([True], dtype=bool)
 
         return {
-            **data, 
+            **data,
             "tokenized_prompt": prompt_tokens,
             "tokenized_prompt_mask": prompt_mask
         }
@@ -100,7 +91,7 @@ class TaskIndexToTaskId(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class ComputeSubtaskStateFromMeta(DataTransformFn):
-    """Computes subtask state from timestamp using dataset.meta.episodes.
+    """timestamp와 episode 길이를 이용해 현재 stage 번호를 계산한다.
     
     Divides episode into task-specific number of stages based on episode length.
     Requires dataset reference to access episode metadata.

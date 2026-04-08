@@ -1,4 +1,8 @@
-"""B1K policy wrapper with action compression, rolling inpainting, and stage voting."""
+"""평가/서빙 시 정책 출력에 후처리를 적용하는 wrapper.
+
+이번 설정은 pi0 + task embedding + flow matching only 경로에 맞춘다.
+기본적으로 stage 추적, 평가용 보정 규칙, 다중 체크포인트는 사용하지 않는다.
+"""
 
 import logging
 import numpy as np
@@ -9,9 +13,8 @@ from collections import deque
 from openpi_client.base_policy import BasePolicy
 from openpi_client.image_tools import resize_with_pad
 from b1k.policies.b1k_policy import extract_state_from_proprio
-from b1k.models.pi_behavior_config import TASK_NUM_STAGES
-from b1k.shared.correction_rules import apply_correction_rules, check_gripper_variation
-from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
+from b1k.configs.task_subset import map_global_to_local
+from b1k.shared.proprioception_indices import PROPRIOCEPTION_INDICES
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +23,15 @@ RESIZE_SIZE = 224
 
 @dataclasses.dataclass
 class B1KWrapperConfig:
-    """Configuration for B1K policy wrapper execution parameters."""
-    actions_to_execute: int = 26
-    actions_to_keep: int = 4
-    execute_in_n_steps: int = 20
-    history_len: int = 3
-    votes_to_promote: int = 2
+    """B1K 서빙용 최소 wrapper 설정."""
+    actions_to_execute: int = 12
+    actions_to_keep: int = 0
+    execute_in_n_steps: int = 12
+    history_len: int = 1
+    votes_to_promote: int = 1
     time_threshold_inpaint: float = 0.3
-    num_steps: int = 20
-    apply_eval_tricks: bool = True
+    num_steps: int = 8
+    apply_eval_tricks: bool = False
 
 
 class B1KPolicyWrapper():
@@ -86,7 +89,7 @@ class B1KPolicyWrapper():
             old_task_id = self.task_id
             self.task_id = new_task_id
             
-            logger.info(f"🔄 Task change detected: {old_task_id} → {new_task_id} (max stages: {TASK_NUM_STAGES[new_task_id]})")
+            logger.info(f"🔄 Task change detected: {old_task_id} → {new_task_id}")
             
             if self.checkpoint_switcher:
                 new_policy = self.checkpoint_switcher.get_policy_for_task(new_task_id)
@@ -124,53 +127,20 @@ class B1KPolicyWrapper():
         }
     
     def update_current_stage(self, predicted_subtask_logits):
-        """Update current stage using majority voting."""
-        if self.task_id is None:
-            return
-            
-        max_stage = TASK_NUM_STAGES[self.task_id] - 1
-        predicted_stage = int(np.argmax(predicted_subtask_logits))
-        
-        if predicted_stage > max_stage:
-            predicted_stage = max_stage
-        
-        self.prediction_history.append(predicted_stage)
-        
-        if len(self.prediction_history) == self.config.history_len:
-            next_stage = self.current_stage + 1
-            
-            if next_stage <= max_stage:
-                votes_for_next = sum(1 for pred in self.prediction_history if pred == next_stage)
-                votes_to_skip = sum(1 for pred in self.prediction_history if pred == next_stage + 1)
-                votes_to_go_back = sum(1 for pred in self.prediction_history if pred == self.current_stage - 1)
-                
-                if votes_for_next >= self.config.votes_to_promote:
-                    old_stage = self.current_stage
-                    self.current_stage = next_stage
-                    self.prediction_history.clear()
-                    logger.info(f"⬆️  Stage advanced: {old_stage} → {self.current_stage} (task {self.task_id}, step {self.step_count})")
-                elif votes_to_skip == self.config.history_len:
-                    old_stage = self.current_stage
-                    self.current_stage = next_stage
-                    self.prediction_history.clear()
-                    logger.info(f"⏭️  Stage skipped: {old_stage} → {self.current_stage} (task {self.task_id}, step {self.step_count})")
-                elif votes_to_go_back == self.config.history_len and self.current_stage > 0:
-                    old_stage = self.current_stage
-                    self.current_stage -= 1
-                    self.prediction_history.clear()
-                    logger.info(f"⬅️  Stage went back: {old_stage} → {self.current_stage} (task {self.task_id}, step {self.step_count})")
+        """이 baseline에서는 stage 추적을 사용하지 않는다."""
+        return
     
     def prepare_batch_for_pi_behavior(self, batch):
-        """Prepare batch for PI_BEHAVIOR model by adding task_id and current_stage."""
+        """모델 입력에 로컬 task id만 추가한다."""
         task_id = self.task_id if self.task_id is not None else -1
         batch_copy = batch.copy()
         if "prompt" in batch_copy:
             del batch_copy["prompt"]
-        
-        batch_copy["tokenized_prompt"] = np.array([task_id, self.current_stage], dtype=np.int32)
-        batch_copy["tokenized_prompt_mask"] = np.array([True, True], dtype=bool)
-        batch_copy["subtask_state"] = np.array(self.current_stage, dtype=np.int32)
-        
+
+        # PI_BEHAVIOR 기본 경로에서는 텍스트 프롬프트를 쓰지 않고
+        # tokenized_prompt 자리에 "로컬 task id 1개"만 넣어서 task embedding lookup에 사용한다.
+        batch_copy["tokenized_prompt"] = np.array([task_id], dtype=np.int32)
+        batch_copy["tokenized_prompt_mask"] = np.array([True], dtype=bool)
         return batch_copy
     
     def _interpolate_actions(self, actions, target_steps):
@@ -192,7 +162,11 @@ class B1KPolicyWrapper():
         
         # Extract task_id from observations
         if "task_id" in obs:
-            new_task_id = int(obs["task_id"][0])
+            # 환경은 원래 전역 task id(예: 18)를 줄 수 있다.
+            # 하지만 모델 내부 embedding 표는 12개 subset 기준으로 다시 만들었으므로
+            # 추론 직전에 반드시 로컬 task id(0~11)로 변환해야 한다.
+            raw_task_id = int(obs["task_id"][0])
+            new_task_id = map_global_to_local(raw_task_id)
             self._handle_task_change(new_task_id)
         
         raw_state = obs["robot_r1::proprio"]
@@ -226,7 +200,7 @@ class B1KPolicyWrapper():
             # Apply eval tricks if enabled
             should_compress = self.config.execute_in_n_steps < self.config.actions_to_execute
             
-            if self.config.apply_eval_tricks:
+            if False and self.config.apply_eval_tricks:
                 if self.task_id is not None:
                     actions_before = actions.copy()
                     actions, corrected_stage = apply_correction_rules(
@@ -296,7 +270,7 @@ class B1KPolicyWrapper():
         
         # Log progress every 100 steps
         if self.step_count % 100 == 0:
-            logger.info(f"📊 Step {self.step_count} | Task: {self.task_id} | Stage: {self.current_stage}/{TASK_NUM_STAGES[self.task_id]-1} | Predictions: {self.prediction_count}")
+            logger.info(f"📊 Step {self.step_count} | Local task: {self.task_id} | Predictions: {self.prediction_count}")
         
         # Convert to torch tensor
         action_tensor = torch.from_numpy(current_action).float()

@@ -1,6 +1,7 @@
-"""Multi-task checkpoint switching for BEHAVIOR-1K.
+"""태스크별 체크포인트를 바꿔 가며 정책을 쓰는 도구.
 
-Was used in the final submission to allow changing checkpoints based on task_id received from the server.
+원래 코드는 50개 태스크 전체가 모두 매핑되어 있어야 한다고 가정했다.
+이번 버전은 실제로 12개 태스크만 사용하는 설정에 맞게 검사 기준을 바꾼다.
 """
 
 import json
@@ -12,14 +13,17 @@ from openpi.policies import policy as _policy
 
 # Import B1K-specific policy_config
 from b1k.policies import policy_config as _policy_config
+from b1k.configs.task_subset import SELECTED_TASKS, SELECTED_TASKS_SET
 
 if TYPE_CHECKING:
     from b1k.training import config as _config
 
 
 class CheckpointSwitcher:
-    """Loads different checkpoints per task. Only one checkpoint in memory at a time.
-    All 50 tasks must be mapped in task_checkpoint_mapping.json.
+    """태스크에 따라 다른 체크포인트를 불러오는 클래스.
+
+    메모리에는 한 번에 하나의 체크포인트만 올려 둔다.
+    이번 설정에서는 전체 50개가 아니라 선택한 12개 태스크만 모두 매핑되어 있으면 된다.
     """
     
     def __init__(
@@ -56,7 +60,7 @@ class CheckpointSwitcher:
         self._validate_all_tasks_covered()
         
         logging.info(f"Checkpoint switcher initialized with {len(self.checkpoint_paths)} checkpoints")
-        logging.info(f"All 50 tasks explicitly mapped to checkpoints")
+        logging.info("현재 사용 중인 12개 태스크가 모두 체크포인트에 연결되어 있다.")
     
     def _load_mapping(self):
         """Load and validate the checkpoint→tasks mapping."""
@@ -97,14 +101,14 @@ class CheckpointSwitcher:
             logging.info(f"Checkpoint '{checkpoint_name}' -> {len(tasks)} tasks: {sorted(tasks)}")
     
     def _validate_all_tasks_covered(self):
-        """Validate that all 50 tasks are explicitly mapped to checkpoints."""
-        all_tasks = set(range(50))
+        """현재 사용할 12개 태스크가 빠짐없이 매핑되었는지 검사한다."""
+        all_tasks = set(SELECTED_TASKS)
         mapped_tasks = set(self.task_to_checkpoint.keys())
         missing_tasks = sorted(all_tasks - mapped_tasks)
         
         if missing_tasks:
             raise ValueError(
-                f"All 50 tasks must be explicitly mapped to checkpoints. "
+                f"현재 사용하는 12개 태스크는 모두 체크포인트에 연결되어 있어야 한다. "
                 f"Missing tasks: {missing_tasks}"
             )
     
@@ -120,6 +124,8 @@ class CheckpointSwitcher:
         Raises:
             ValueError: If task_id not mapped (should never happen after validation)
         """
+        if task_id not in SELECTED_TASKS_SET:
+            raise ValueError(f"Task {task_id} 는 현재 사용 설정의 12개 subset에 없다.")
         if task_id not in self.task_to_checkpoint:
             raise ValueError(f"Task {task_id} not mapped to any checkpoint")
         
